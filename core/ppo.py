@@ -42,6 +42,7 @@ class TrainerConfig:
     kl_coef: float = 0.0
     ppo_minibatch: int = 64
     num_epochs: int = 1
+    checkpoint_forward: bool = False
 
 
 def _pixels(val: Optional[int]) -> Optional[int]:
@@ -104,6 +105,7 @@ def update(
     minibatch_size: int = 64,
     num_epochs: int = 1,
     kl_ctrl: Optional[AdaptiveKL] = None,
+    checkpoint_forward: bool = False,
 ) -> Tuple[TrainState, dict]:
     """Apply PPO-style updates over minibatches and return new TrainState + metrics."""
     tokens_all = batch.tokens
@@ -144,7 +146,10 @@ def update(
                     params=params,
                     method=ts.model_def.forward_vlm,
                 )
-            logits, _ = call_with_params(p)
+            forward = call_with_params
+            if checkpoint_forward:
+                forward = jax.checkpoint(forward, prevent_cse=False)
+            logits, _ = forward(p)
             all_logprobs = jax.nn.log_softmax(logits, axis=-1)
             token_logprobs = jnp.sum(all_logprobs * jax.nn.one_hot(text_target, logits.shape[-1]), axis=-1)
             entropy = -jnp.sum(jax.nn.softmax(logits, axis=-1) * all_logprobs, axis=-1)

@@ -76,6 +76,8 @@ uv run python core/train.py \
   --total_steps=10000
 ```
 
+> **Need to fit on an 8 GB GPU?** Enable the LoRA + activation checkpointing path described in [`docs/low_vram_training.md`](docs/low_vram_training.md) to freeze the 4B backbone and train lightweight adapters with micro-batches.
+
 **Evaluate**
 ```bash
 uv run python core/eval.py \

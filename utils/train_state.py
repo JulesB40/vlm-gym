@@ -23,6 +23,7 @@ class TrainState(flax.struct.PyTreeNode):
     tx: Any = nonpytree_field()
     opt_state: Any
     use_ema: bool = False
+    frozen_params: Any = nonpytree_field(default=None)
 
     @classmethod
     def create(cls, rng, model_def, model_input, tx, use_ema=False, **kwargs):
@@ -46,6 +47,26 @@ class TrainState(flax.struct.PyTreeNode):
     def call_model(self, *args, params=None, use_ema_params=False, **kwargs):
         if params is None:
             params = self.params if not use_ema_params else self.params_ema
+        if self.frozen_params is not None:
+            frozen = flax.core.unfreeze(self.frozen_params)
+            updates = flax.core.unfreeze(params)
+
+            def _clone(tree):
+                if isinstance(tree, dict):
+                    return {k: _clone(v) for k, v in tree.items()}
+                return tree
+
+            def _merge(base, add):
+                for key, value in add.items():
+                    if isinstance(value, dict):
+                        child = base.get(key, {})
+                        base[key] = _merge(child if isinstance(child, dict) else {}, value)
+                    else:
+                        base[key] = value
+                return base
+
+            merged = _merge(_clone(frozen), updates)
+            params = flax.core.freeze(merged)
         return self.apply_fn({"params": params}, *args, **kwargs)
 
     def update_ema(self, tau): # Tau should be close to 1, e.g. 0.999.
@@ -61,7 +82,10 @@ class TrainState(flax.struct.PyTreeNode):
             'params_ema': self.params_ema,
             'opt_state': self.opt_state,
             'step': self.step,
+            'frozen_params': self.frozen_params,
         }
 
     def load(self, data):
+        if 'frozen_params' not in data:
+            data = {**data, 'frozen_params': self.frozen_params}
         return self.replace(**data)

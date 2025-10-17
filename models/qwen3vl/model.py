@@ -8,7 +8,7 @@ import glob
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Optional, Sequence, Tuple, Union
 
 import flax
 import flax.linen as nn
@@ -433,22 +433,112 @@ class RMSNorm(nn.Module):
         return rms_norm(x, gamma, self.eps)
 
 
+@dataclass
+class LoRAConfig:
+    rank: int
+    alpha: float = 16.0
+    dropout: float = 0.0
+    target_modules: tuple[str, ...] = ()
+
+    def enabled(self) -> bool:
+        return int(self.rank) > 0
+
+    def for_module(self, name: str) -> int:
+        if not self.enabled():
+            return 0
+        if not self.target_modules:
+            return int(self.rank)
+        return int(self.rank) if name in self.target_modules else 0
+
+
+class DenseWithLoRA(nn.Module):
+    features: int
+    use_bias: bool = True
+    dtype: DType = jnp.bfloat16
+    param_dtype: DType = jnp.float32
+    lora_rank: int = 0
+    lora_alpha: float = 16.0
+
+    kernel_init: Callable[[Any, tuple[int, ...], DType], jax.Array] = nn.initializers.lecun_normal()
+    bias_init: Callable[[Any, tuple[int, ...], DType], jax.Array] = nn.initializers.zeros_init()
+
+    @nn.compact
+    def __call__(self, inputs: jax.Array) -> jax.Array:
+        features = int(self.features)
+        if features <= 0:
+            raise ValueError("DenseWithLoRA features must be positive")
+        if inputs.ndim == 0:
+            raise ValueError("DenseWithLoRA expects inputs with rank >= 1")
+
+        in_features = int(inputs.shape[-1])
+        kernel = self.param(
+            "kernel",
+            self.kernel_init,
+            (in_features, features),
+            self.param_dtype,
+        )
+        kernel = kernel.astype(self.dtype)
+        out = jnp.matmul(inputs, kernel)
+
+        if self.use_bias:
+            bias = self.param("bias", self.bias_init, (features,), self.param_dtype)
+            out = out + bias.astype(self.dtype)
+
+        rank = int(self.lora_rank or 0)
+        if rank > 0:
+            lora_a = self.param(
+                "lora_a",
+                nn.initializers.kaiming_normal(),
+                (in_features, rank),
+                self.param_dtype,
+            )
+            lora_b = self.param(
+                "lora_b",
+                nn.initializers.zeros_init(),
+                (rank, features),
+                self.param_dtype,
+            )
+            lora_out = jnp.matmul(inputs, lora_a.astype(self.dtype))
+            lora_out = jnp.matmul(lora_out, lora_b.astype(self.dtype))
+            scale = self.lora_alpha / float(rank)
+            out = out + lora_out * scale
+
+        return out
+
+
 class FeedForward(nn.Module):
     hidden_size: int
     intermediate_size: int
     dtype: DType = jnp.bfloat16
     use_bias: bool = False
+    lora: Optional[LoRAConfig] = None
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        gate = nn.Dense(
-            self.intermediate_size, use_bias=self.use_bias, dtype=self.dtype, name="gate_proj"
+        alpha = self.lora.alpha if self.lora else 16.0
+        gate = DenseWithLoRA(
+            self.intermediate_size,
+            use_bias=self.use_bias,
+            dtype=self.dtype,
+            lora_rank=self.lora.for_module("gate_proj") if self.lora else 0,
+            lora_alpha=alpha,
+            name="gate_proj",
         )(x)
-        up = nn.Dense(
-            self.intermediate_size, use_bias=self.use_bias, dtype=self.dtype, name="up_proj"
+        up = DenseWithLoRA(
+            self.intermediate_size,
+            use_bias=self.use_bias,
+            dtype=self.dtype,
+            lora_rank=self.lora.for_module("up_proj") if self.lora else 0,
+            lora_alpha=alpha,
+            name="up_proj",
         )(x)
-        down = nn.Dense(
-            self.hidden_size, use_bias=self.use_bias, dtype=self.dtype, name="down_proj"
+        down = DenseWithLoRA(
+            self.hidden_size,
+            use_bias=self.use_bias,
+            dtype=self.dtype,
+            lora_rank=self.lora.for_module("down_proj") if self.lora else 0,
+            lora_alpha=alpha,
+            name="down_proj",
         )(nn.silu(gate) * up)
         return down
 
@@ -461,6 +551,7 @@ class MultiHeadAttention(nn.Module):
     rope_section: Optional[Sequence[int]] = None
     eps: float = 1e-6
     dtype: DType = jnp.bfloat16
+    lora: Optional[LoRAConfig] = None
 
     @nn.compact
     def __call__(
@@ -473,14 +564,30 @@ class MultiHeadAttention(nn.Module):
         layer_id: Optional[int] = None,
         update_lengths: bool = False,
     ) -> tuple[jax.Array, Optional["KVCache"]]:
-        q = nn.Dense(
-            self.num_heads * self.head_dim, use_bias=True, dtype=self.dtype, name="q_proj"
+        alpha = self.lora.alpha if self.lora else 16.0
+        q = DenseWithLoRA(
+            self.num_heads * self.head_dim,
+            use_bias=True,
+            dtype=self.dtype,
+            lora_rank=self.lora.for_module("q_proj") if self.lora else 0,
+            lora_alpha=alpha,
+            name="q_proj",
         )(x)
-        k = nn.Dense(
-            self.num_kv_heads * self.head_dim, use_bias=True, dtype=self.dtype, name="k_proj"
+        k = DenseWithLoRA(
+            self.num_kv_heads * self.head_dim,
+            use_bias=True,
+            dtype=self.dtype,
+            lora_rank=self.lora.for_module("k_proj") if self.lora else 0,
+            lora_alpha=alpha,
+            name="k_proj",
         )(x)
-        v = nn.Dense(
-            self.num_kv_heads * self.head_dim, use_bias=True, dtype=self.dtype, name="v_proj"
+        v = DenseWithLoRA(
+            self.num_kv_heads * self.head_dim,
+            use_bias=True,
+            dtype=self.dtype,
+            lora_rank=self.lora.for_module("v_proj") if self.lora else 0,
+            lora_alpha=alpha,
+            name="v_proj",
         )(x)
 
         batch, seqlen, _ = q.shape
@@ -572,9 +679,14 @@ class MultiHeadAttention(nn.Module):
                 v.astype(jnp.float32),
             ).astype(self.dtype)
         attn_output = jnp.transpose(attn_output, (0, 2, 1, 3)).reshape(batch, seqlen, -1)
-        out = nn.Dense(self.hidden_size, use_bias=False, dtype=self.dtype, name="o_proj")(
-            attn_output
-        )
+        out = DenseWithLoRA(
+            self.hidden_size,
+            use_bias=False,
+            dtype=self.dtype,
+            lora_rank=self.lora.for_module("o_proj") if self.lora else 0,
+            lora_alpha=alpha,
+            name="o_proj",
+        )(attn_output)
         return out, cache
 
 
@@ -587,6 +699,7 @@ class DecoderBlock(nn.Module):
     rope_section: Sequence[int]
     eps: float
     dtype: DType = jnp.bfloat16
+    lora: Optional[LoRAConfig] = None
 
     def setup(self) -> None:
         self.input_norm = RMSNorm(self.hidden_size, self.eps, self.dtype)
@@ -599,11 +712,13 @@ class DecoderBlock(nn.Module):
             rope_section=self.rope_section,
             eps=self.eps,
             dtype=self.dtype,
+            lora=self.lora,
         )
         self.mlp = FeedForward(
             hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size,
             dtype=self.dtype,
+            lora=self.lora,
         )
 
     def __call__(
@@ -690,6 +805,7 @@ class KVCache(flax.struct.PyTreeNode):
 class Qwen3VLModel(nn.Module):
     spec: Qwen3VLSpec
     dtype: DType = jnp.bfloat16
+    lora: Optional[LoRAConfig] = None
 
     def setup(self) -> None:
         text = self.spec.text
@@ -706,6 +822,7 @@ class Qwen3VLModel(nn.Module):
                 rope_section=tuple(text.rope_section),
                 eps=text.rms_norm_eps,
                 dtype=self.dtype,
+                lora=self.lora,
             )
             for _ in range(text.num_hidden_layers)
         ]
@@ -983,6 +1100,34 @@ def spec_from_config(cfg: dict[str, Any]) -> Qwen3VLSpec:
     )
 
 
+def _merge_missing(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
+    for key, value in src.items():
+        if isinstance(value, dict):
+            target = dst.setdefault(key, {})
+            _merge_missing(target, value)
+        elif key not in dst:
+            dst[key] = value
+    return dst
+
+
+def _ensure_lora_params(model: Qwen3VLModel, params: flax.core.FrozenDict) -> flax.core.FrozenDict:
+    if model.lora is None or not model.lora.enabled():
+        return params
+
+    text_spec = model.spec.text
+    axes = len(tuple(int(x) for x in text_spec.rope_section))
+    rope_dim = sum(int(x) for x in text_spec.rope_section) * 2
+    dummy_tokens = jnp.zeros((1, 1), dtype=jnp.int32)
+    dummy_cos = jnp.zeros((axes, 1, 1, rope_dim), dtype=model.dtype)
+    dummy_sin = jnp.zeros((axes, 1, 1, rope_dim), dtype=model.dtype)
+
+    init_vars = model.init(jax.random.PRNGKey(0), dummy_tokens, dummy_cos, dummy_sin)
+    init_params = flax.core.unfreeze(init_vars["params"])
+    merged = flax.core.unfreeze(params)
+    merged = _merge_missing(merged, init_params)
+    return flax.core.freeze(merged)
+
+
 # Regex map: HF torch param names -> Flax tree
 _TEXT_KEY_RULES = {
     r"model\.language_model\.model\.embed_tokens\.weight": "embed/embedding",
@@ -1094,10 +1239,13 @@ def _torch_key_to_flax(key: str) -> Optional[str]:
     return None
 
 
-def create_model_from_hf(hf_dir: str) -> tuple[Qwen3VLModel, dict[str, Any]]:
+def create_model_from_hf(
+    hf_dir: str,
+    lora: Optional[LoRAConfig] = None,
+) -> tuple[Qwen3VLModel, dict[str, Any]]:
     cfg = _load_hf_config(hf_dir)
     spec = spec_from_config(cfg)
-    model = Qwen3VLModel(spec)
+    model = Qwen3VLModel(spec, lora=lora)
 
     dummy_ids = jnp.zeros((1, 1), dtype=jnp.int32)
     rope_axes = len(tuple(int(x) for x in spec.text.rope_section))
@@ -1173,21 +1321,31 @@ def create_model_from_hf(hf_dir: str) -> tuple[Qwen3VLModel, dict[str, Any]]:
             param_dict.setdefault("lm_head", {})["kernel"] = embed_weight.T
             print(f"Note: tie_word_embeddings is True, copying embed weights to lm_head (transposed)")
 
-    return model, flax.core.freeze(param_dict)
+    params = flax.core.freeze(param_dict)
+    if lora and lora.enabled():
+        params = _ensure_lora_params(model, params)
+    return model, params
 
 
-def create_model_from_ckpt(ckpt_dir: str) -> tuple[Qwen3VLModel, dict[str, Any]]:
+def create_model_from_ckpt(
+    ckpt_dir: str,
+    lora: Optional[LoRAConfig] = None,
+) -> tuple[Qwen3VLModel, dict[str, Any]]:
     from vlmrl.utils.checkpoint import Checkpoint
 
     cfg = _load_hf_config(ckpt_dir)
     spec = spec_from_config(cfg)
-    model = Qwen3VLModel(spec)
+    model = Qwen3VLModel(spec, lora=lora)
     ckpt = Checkpoint(f"{ckpt_dir}/params.pkl", parallel=False)
     params = ckpt.load_as_dict()["params"]
+    params = flax.core.freeze(params)
+    if lora and lora.enabled():
+        params = _ensure_lora_params(model, params)
     return model, params
 
 
 __all__ = [
+    "LoRAConfig",
     "Qwen3VLModel",
     "KVCache",
     "apply_multimodal_rotary_pos_emb",

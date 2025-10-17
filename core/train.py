@@ -22,6 +22,8 @@ from typing import Any, Dict, Optional
 # This was annoying and should probably not be off by default
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
+import flax
+from flax import traverse_util
 import jax
 import jax.numpy as jnp
 import ml_collections
@@ -34,7 +36,7 @@ from transformers import AutoTokenizer
 from vlmrl.core.kl import AdaptiveKL
 from vlmrl.core.ppo import TrainerConfig, collect, update
 from vlmrl.envs.base import create_env
-from vlmrl.models.qwen3vl.model import Qwen3VLModel, create_model_from_ckpt
+from vlmrl.models.qwen3vl.model import LoRAConfig, Qwen3VLModel, create_model_from_ckpt
 from vlmrl.utils.checkpoint import Checkpoint
 from vlmrl.utils.configs import define_flag_dict
 from vlmrl.utils.train_state import TrainState
@@ -97,6 +99,16 @@ config = ml_collections.ConfigDict({
     "weight_decay": 1e-2,
     "max_grad_norm": 1.0,
     "use_ema": 0,
+
+    # Memory / parameter-efficient tuning
+    "policy_checkpoint": 1,
+    "lora_rank": 0,
+    "lora_alpha": 32.0,
+    "lora_targets": "q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj",
+    "lora_dropout": 0.0,
+    "lora_freeze_base": 1,
+    "lora_train_bias": 0,
+    "lora_train_lm_head": 0,
 })
 define_flag_dict(config)
 FLAGS = flags.FLAGS
@@ -208,7 +220,85 @@ def _format_ground_truth(env_infos: Dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-def _make_optimizer() -> optax.GradientTransformation:
+def _parse_lora_targets(raw: str) -> tuple[str, ...]:
+    if not raw:
+        return ()
+    parts = [segment.strip() for segment in str(raw).split(",")]
+    return tuple(part for part in parts if part)
+
+
+def _build_lora_config() -> Optional[LoRAConfig]:
+    rank = int(getattr(FLAGS, "lora_rank", 0) or 0)
+    if rank <= 0:
+        return None
+    targets = _parse_lora_targets(getattr(FLAGS, "lora_targets", ""))
+    if not targets:
+        targets = (
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        )
+    return LoRAConfig(
+        rank=rank,
+        alpha=float(getattr(FLAGS, "lora_alpha", 32.0) or 32.0),
+        dropout=float(getattr(FLAGS, "lora_dropout", 0.0) or 0.0),
+        target_modules=targets,
+    )
+
+
+def _build_trainable_mask(
+    params: flax.core.FrozenDict,
+    train_bias: bool,
+    train_lm_head: bool,
+) -> flax.core.FrozenDict:
+    param_dict = flax.core.unfreeze(params)
+    flat_params = traverse_util.flatten_dict(param_dict, keep_empty_nodes=True)
+    mask_flat: dict[tuple[str, ...], bool] = {}
+    for key, value in flat_params.items():
+        if isinstance(value, dict):
+            continue
+        train = False
+        if any(part in ("lora_a", "lora_b") for part in key):
+            train = True
+        elif train_bias and key and key[-1] == "bias":
+            train = True
+        elif train_lm_head and key and key[0] == "lm_head":
+            train = True
+        mask_flat[key] = train
+    return flax.core.freeze(traverse_util.unflatten_dict(mask_flat))
+
+
+def _split_params(
+    params: flax.core.FrozenDict,
+    mask: flax.core.FrozenDict,
+) -> tuple[flax.core.FrozenDict, flax.core.FrozenDict]:
+    param_dict = flax.core.unfreeze(params)
+    mask_dict = flax.core.unfreeze(mask)
+    flat_params = traverse_util.flatten_dict(param_dict, keep_empty_nodes=True)
+    flat_mask = traverse_util.flatten_dict(mask_dict, keep_empty_nodes=True)
+    trainable_flat: dict[tuple[str, ...], Any] = {}
+    frozen_flat: dict[tuple[str, ...], Any] = {}
+    for key, value in flat_params.items():
+        if isinstance(value, dict):
+            continue
+        if flat_mask.get(key, False):
+            trainable_flat[key] = value
+        else:
+            frozen_flat[key] = value
+    trainable = traverse_util.unflatten_dict(trainable_flat)
+    frozen = traverse_util.unflatten_dict(frozen_flat)
+    return flax.core.freeze(trainable), flax.core.freeze(frozen)
+
+
+def _count_params(params: flax.core.FrozenDict) -> int:
+    return sum(int(arr.size) for arr in jax.tree_util.tree_leaves(params))
+
+
+def _make_optimizer(mask: Optional[Any] = None) -> optax.GradientTransformation:
     lr = float(FLAGS.learning_rate)
     weight_decay = float(FLAGS.weight_decay)
     grad_clip = float(FLAGS.max_grad_norm)
@@ -231,7 +321,10 @@ def _make_optimizer() -> optax.GradientTransformation:
     if grad_clip and grad_clip > 0:
         chain.append(optax.clip_by_global_norm(grad_clip))
     chain.append(base_opt)
-    return optax.chain(*chain)
+    opt = optax.chain(*chain)
+    if mask is not None:
+        opt = optax.masked(opt, mask)
+    return opt
 
 
 def _build_env(tokenizer):
@@ -272,14 +365,34 @@ def _build_env(tokenizer):
 
 
 def _setup_train_state(model: Qwen3VLModel, params, rng: jax.Array) -> TrainState:
-    tx = _make_optimizer()
+    lora_rank = int(getattr(FLAGS, "lora_rank", 0) or 0)
+    freeze_base = bool(int(getattr(FLAGS, "lora_freeze_base", 1) or 1)) and lora_rank > 0
+    train_bias = bool(int(getattr(FLAGS, "lora_train_bias", 0) or 0))
+    train_lm_head = bool(int(getattr(FLAGS, "lora_train_lm_head", 0) or 0))
+
+    frozen_params = None
+    trainable_params = params
+
+    if freeze_base:
+        mask = _build_trainable_mask(params, train_bias, train_lm_head)
+        trainable_params, frozen_params = _split_params(params, mask)
+        if jax.process_index() == 0:
+            total_params = _count_params(params)
+            trainable_count = _count_params(trainable_params)
+            share = (trainable_count / total_params * 100.0) if total_params else 0.0
+            print(
+                f"[train] LoRA freeze enabled: {trainable_count:,} trainable params ({share:.2f}% of {total_params:,})."
+            )
+
+    tx = _make_optimizer(None)
     use_ema = bool(int(getattr(FLAGS, "use_ema", 0) or 0) == 1)
     train_state = TrainState.create_with_params(
         rng=rng,
         model_def=model,
-        params=params,
+        params=trainable_params,
         tx=tx,
         use_ema=use_ema,
+        frozen_params=frozen_params,
     )
     return jax.device_put(train_state)
 
@@ -322,9 +435,14 @@ def _maybe_save(train_state: TrainState, save_dir: str, step: int) -> None:
 def main(_):
     FLAGS(sys.argv)
 
+    lora_cfg = _build_lora_config()
     if jax.process_index() == 0:
         print(f"[train] Loading model from {FLAGS.model_dir}")
-    model, params = create_model_from_ckpt(FLAGS.model_dir)
+        if lora_cfg and lora_cfg.enabled():
+            targets = lora_cfg.target_modules or ("all dense",)
+            target_str = ", ".join(targets)
+            print(f"[train] LoRA rank {lora_cfg.rank} enabled on: {target_str}")
+    model, params = create_model_from_ckpt(FLAGS.model_dir, lora=lora_cfg)
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.model_dir, trust_remote_code=False)
     pad_id, eos_id = _resolve_pad_and_eos(tokenizer, model)
     image_pad_id = _resolve_image_pad_id(tokenizer, FLAGS.model_dir)
@@ -351,6 +469,7 @@ def main(_):
         kl_coef=float(FLAGS.kl_coef),
         ppo_minibatch=int(FLAGS.ppo_minibatch),
         num_epochs=int(FLAGS.ppo_epochs),
+        checkpoint_forward=bool(int(getattr(FLAGS, "policy_checkpoint", 0) or 0)),
     )
 
     kl_ctrl = None
@@ -407,6 +526,7 @@ def main(_):
             minibatch_size=trainer_cfg.ppo_minibatch,
             num_epochs=trainer_cfg.num_epochs,
             kl_ctrl=kl_ctrl,
+            checkpoint_forward=trainer_cfg.checkpoint_forward,
         )
 
         returns = np.asarray(jax.device_get(rollout.returns))
