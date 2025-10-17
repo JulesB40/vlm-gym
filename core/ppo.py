@@ -43,6 +43,8 @@ class TrainerConfig:
     ppo_minibatch: int = 64
     num_epochs: int = 1
     checkpoint_forward: bool = False
+    groups_per_batch: int = 1
+    group_size: Optional[int] = None
 
 
 def _pixels(val: Optional[int]) -> Optional[int]:
@@ -69,24 +71,44 @@ def collect(
         max_new_tokens=cfg.max_new_tokens,
     )
 
-    episode_batch = collect_episodes(
-        env,
-        tokenizer,
-        model,
-        train_state.params,
-        sampling_cfg,
-        image_pad_id=cfg.image_pad_id,
-        batch_size=batch_size,
-        rng=rng,
-        min_pixels=_pixels(cfg.vlm_min_pixels),
-        max_pixels=_pixels(cfg.vlm_max_pixels),
-        max_sequence_length=cfg.max_sequence_length,
-        return_logprobs=True,
-    )
+    group_size = cfg.group_size if (cfg.group_size is not None and int(cfg.group_size) > 0) else batch_size
+    group_size = max(1, min(int(group_size), batch_size))
+    groups = max(1, int(cfg.groups_per_batch))
+
+    keys = jax.random.split(rng, groups)
+    episodes = []
+    collected = 0
+    for group_idx in range(groups):
+        remaining = batch_size - collected
+        if remaining <= 0:
+            break
+        current_size = group_size if group_idx < groups - 1 else remaining
+        current_size = max(1, min(current_size, remaining))
+        group_batch = collect_episodes(
+            env,
+            tokenizer,
+            model,
+            train_state.params,
+            sampling_cfg,
+            image_pad_id=cfg.image_pad_id,
+            batch_size=current_size,
+            rng=keys[group_idx],
+            min_pixels=_pixels(cfg.vlm_min_pixels),
+            max_pixels=_pixels(cfg.vlm_max_pixels),
+            max_sequence_length=cfg.max_sequence_length,
+            return_logprobs=True,
+        )
+        episodes.extend(group_batch.episodes)
+        collected += len(group_batch.episodes)
+        if collected >= batch_size:
+            break
+
+    if not episodes:
+        raise ValueError("collect() expected at least one episode, got none")
 
     rollout, batch = episodes_to_training_batch(
         model,
-        episode_batch.episodes,
+        episodes,
         pad_id=cfg.pad_id,
         max_sequence_length=cfg.max_sequence_length,
     )

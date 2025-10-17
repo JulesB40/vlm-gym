@@ -70,6 +70,8 @@ config = ml_collections.ConfigDict({
     # Training duration
     "total_steps": 1000,
     "batch_size": 16,
+    "groups_per_batch": 1,
+    "group_size": 0,
     "log_interval": 1,
 
     # Sampling / sequence knobs
@@ -453,6 +455,17 @@ def main(_):
 
     env = _build_env(tokenizer)
 
+    group_size_flag = int(getattr(FLAGS, "group_size", 0) or 0)
+    groups_flag = int(getattr(FLAGS, "groups_per_batch", 0) or 0)
+    base_batch = int(getattr(FLAGS, "batch_size", 0) or 0)
+
+    if group_size_flag <= 0:
+        group_size_flag = max(1, base_batch)
+    if groups_flag <= 0:
+        groups_flag = max(1, int(np.ceil(max(1, base_batch) / max(1, group_size_flag))))
+
+    effective_batch_size = max(1, group_size_flag * groups_flag)
+
     trainer_cfg = TrainerConfig(
         pad_id=pad_id,
         eos_id=eos_id,
@@ -470,7 +483,15 @@ def main(_):
         ppo_minibatch=int(FLAGS.ppo_minibatch),
         num_epochs=int(FLAGS.ppo_epochs),
         checkpoint_forward=bool(int(getattr(FLAGS, "policy_checkpoint", 0) or 0)),
+        groups_per_batch=groups_flag,
+        group_size=group_size_flag,
     )
+
+    if effective_batch_size != base_batch and jax.process_index() == 0:
+        print(
+            "[train] Using grouped batch collection:",
+            f"{groups_flag} group(s) × {group_size_flag} = {effective_batch_size} episodes",
+        )
 
     kl_ctrl = None
     if int(getattr(FLAGS, "adaptive_kl", 0) or 0) == 1:
@@ -497,7 +518,7 @@ def main(_):
             print(f"[train] W&B setup failed: {exc}")
 
     total_steps = int(FLAGS.total_steps)
-    batch_size = int(FLAGS.batch_size)
+    batch_size = effective_batch_size
     save_interval = int(getattr(FLAGS, "save_interval", 0) or 0)
     log_interval = max(1, int(getattr(FLAGS, "log_interval", 1) or 1))
 
